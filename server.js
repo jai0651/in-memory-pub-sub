@@ -200,6 +200,14 @@ class PubSubServer {
       });
     });
 
+    this.pubsubEngine.on('messageDropped', (clientId, topicName, droppedMessage) => {
+      this.logger.logPubSubEvent('message dropped', topicName, {
+        clientId,
+        droppedMessageId: droppedMessage.message?.id,
+        reason: 'backpressure'
+      });
+    });
+
     // Heartbeat events
     this.pubsubEngine.on('heartbeat', () => {
       // Send heartbeat to all WebSocket clients

@@ -2,6 +2,100 @@ const { EventEmitter } = require('events');
 const { v4: uuidv4 } = require('uuid');
 
 /**
+ * Bounded Queue for Individual Subscribers
+ * Implements proper backpressure handling with configurable policies
+ */
+class SubscriberQueue {
+  constructor(clientId, maxSize = 100, policy = 'drop_oldest') {
+    this.clientId = clientId;
+    this.maxSize = maxSize;
+    this.policy = policy; // 'drop_oldest' or 'disconnect'
+    this.queue = [];
+    this.droppedCount = 0;
+    this.totalProcessed = 0;
+  }
+
+  /**
+   * Add a message to the queue with backpressure handling
+   * @param {Object} message - Message to add
+   * @param {WebSocket} ws - WebSocket connection
+   * @returns {Object} - Result of the operation
+   */
+  add(message, ws) {
+    // Check if queue is full
+    if (this.queue.length >= this.maxSize) {
+      if (this.policy === 'disconnect') {
+        // Disconnect policy: close connection with SLOW_CONSUMER error
+        try {
+          ws.close(1013, 'SLOW_CONSUMER');
+        } catch (error) {
+          // Ignore close errors
+        }
+        return {
+          success: false,
+          action: 'disconnected',
+          reason: 'SLOW_CONSUMER',
+          droppedCount: this.droppedCount
+        };
+      } else {
+        // drop_oldest policy: remove oldest message and add new one
+        const droppedMessage = this.queue.shift();
+        this.droppedCount++;
+        
+        this.queue.push(message);
+        this.totalProcessed++;
+        
+        return {
+          success: true,
+          action: 'dropped_oldest',
+          droppedMessage: droppedMessage,
+          droppedCount: this.droppedCount
+        };
+      }
+    } else {
+      // Queue has space, add message normally
+      this.queue.push(message);
+      this.totalProcessed++;
+      return {
+        success: true,
+        action: 'added',
+        droppedCount: this.droppedCount
+      };
+    }
+  }
+
+  /**
+   * Get the next message from the queue
+   * @returns {Object|null} - Next message or null if empty
+   */
+  getNext() {
+    return this.queue.length > 0 ? this.queue.shift() : null;
+  }
+
+  /**
+   * Get queue statistics
+   * @returns {Object} - Queue statistics
+   */
+  getStats() {
+    return {
+      clientId: this.clientId,
+      queueSize: this.queue.length,
+      maxSize: this.maxSize,
+      droppedCount: this.droppedCount,
+      totalProcessed: this.totalProcessed,
+      policy: this.policy
+    };
+  }
+
+  /**
+   * Clear the queue
+   */
+  clear() {
+    this.queue = [];
+  }
+}
+
+/**
  * In-Memory Pub/Sub System
  * 
  * Features:
@@ -9,7 +103,7 @@ const { v4: uuidv4 } = require('uuid');
  * - Fan-out delivery (each subscriber gets every message exactly once)
  * - Topic isolation (no cross-topic message leaks)
  * - Concurrency safety with Map-based subscriber management
- * - Backpressure handling with bounded queues
+ * - Backpressure handling with bounded per-subscriber queues
  * - Message replay support with ring buffer
  * - Graceful shutdown support
  */
@@ -20,8 +114,9 @@ class PubSubEngine extends EventEmitter {
     
     this.topics = new Map();
     this.clientTopics = new Map(); // clientId -> Set of topics
+    this.subscriberQueues = new Map(); // clientId -> SubscriberQueue
     this.maxMessagesPerTopic = options.maxMessagesPerTopic || 100;
-    this.maxQueueSize = options.maxQueueSize || 1000;
+    this.maxQueueSize = options.maxQueueSize || 100;
     this.backpressurePolicy = options.backpressurePolicy || 'drop_oldest'; // 'drop_oldest' or 'disconnect'
     
     // Heartbeat configuration
@@ -105,6 +200,15 @@ class PubSubEngine extends EventEmitter {
       return { success: false, error: 'ALREADY_SUBSCRIBED' };
     }
 
+    // Create subscriber queue if it doesn't exist
+    if (!this.subscriberQueues.has(clientId)) {
+      this.subscriberQueues.set(clientId, new SubscriberQueue(
+        clientId, 
+        this.maxQueueSize, 
+        this.backpressurePolicy
+      ));
+    }
+
     // Add subscriber
     topic.subscribers.set(clientId, ws);
     
@@ -152,6 +256,8 @@ class PubSubEngine extends EventEmitter {
       clientTopics.delete(topicName);
       if (clientTopics.size === 0) {
         this.clientTopics.delete(clientId);
+        // Clean up subscriber queue when client has no more topics
+        this.subscriberQueues.delete(clientId);
       }
     }
 
@@ -187,19 +293,63 @@ class PubSubEngine extends EventEmitter {
       topic.messages.shift(); // Remove oldest message
     }
 
-    // Fan-out to all subscribers
+    // Fan-out to all subscribers using bounded queues
     const deliveryResults = [];
     for (const [clientId, ws] of topic.subscribers) {
       try {
-        const result = this.sendToClient(ws, {
+        // Get or create subscriber queue
+        const subscriberQueue = this.subscriberQueues.get(clientId);
+        if (!subscriberQueue) {
+          deliveryResults.push({ 
+            clientId, 
+            success: false, 
+            error: 'SUBSCRIBER_QUEUE_NOT_FOUND' 
+          });
+          continue;
+        }
+
+        // Create the message to send
+        const messageToSend = {
           type: 'event',
           topic: topicName,
           message: message,
           ts: new Date().toISOString()
-        });
-        deliveryResults.push({ clientId, success: result });
+        };
+
+        // Add message to subscriber's bounded queue
+        const queueResult = subscriberQueue.add(messageToSend, ws);
+        
+        if (queueResult.success) {
+          // Message was added to queue successfully
+          if (queueResult.action === 'dropped_oldest') {
+            // Log that an old message was dropped
+            this.emit('messageDropped', clientId, topicName, queueResult.droppedMessage);
+          }
+          
+          // Try to send the message immediately
+          const sendResult = this.sendToClient(ws, messageToSend);
+          deliveryResults.push({ 
+            clientId, 
+            success: sendResult,
+            action: queueResult.action,
+            droppedCount: queueResult.droppedCount
+          });
+        } else {
+          // Queue policy triggered (e.g., disconnect)
+          deliveryResults.push({ 
+            clientId, 
+            success: false, 
+            action: queueResult.action,
+            reason: queueResult.reason,
+            droppedCount: queueResult.droppedCount
+          });
+        }
       } catch (error) {
-        deliveryResults.push({ clientId, success: false, error: error.message });
+        deliveryResults.push({ 
+          clientId, 
+          success: false, 
+          error: error.message 
+        });
       }
     }
 
@@ -212,7 +362,8 @@ class PubSubEngine extends EventEmitter {
   }
 
   /**
-   * Send message to a specific client with backpressure handling
+   * Send message to a specific client
+   * Note: Backpressure is now handled by SubscriberQueue
    * @param {WebSocket} ws - WebSocket connection
    * @param {Object} message - Message to send
    * @returns {boolean} - True if sent successfully
@@ -224,17 +375,7 @@ class PubSubEngine extends EventEmitter {
         return false;
       }
 
-      // Check backpressure
-      if (ws.bufferedAmount > this.maxQueueSize) {
-        if (this.backpressurePolicy === 'disconnect') {
-          ws.close(1013, 'SLOW_CONSUMER');
-          return false;
-        } else {
-          // drop_oldest policy - just return false
-          return false;
-        }
-      }
-
+      // Send message directly (backpressure handled by queue)
       ws.send(JSON.stringify(message));
       return true;
     } catch (error) {
@@ -286,7 +427,12 @@ class PubSubEngine extends EventEmitter {
     const stats = {
       topics: {},
       totalSubscribers: 0,
-      totalMessages: 0
+      totalMessages: 0,
+      queues: {
+        totalQueues: this.subscriberQueues.size,
+        totalDroppedMessages: 0,
+        queueStats: {}
+      }
     };
 
     for (const [topicName, topic] of this.topics) {
@@ -296,6 +442,13 @@ class PubSubEngine extends EventEmitter {
       };
       stats.totalSubscribers += topic.subscribers.size;
       stats.totalMessages += topic.messages.length;
+    }
+
+    // Add queue statistics
+    for (const [clientId, queue] of this.subscriberQueues) {
+      const queueStats = queue.getStats();
+      stats.queues.queueStats[clientId] = queueStats;
+      stats.queues.totalDroppedMessages += queueStats.droppedCount;
     }
 
     return stats;
@@ -312,10 +465,14 @@ class PubSubEngine extends EventEmitter {
       return null;
     }
 
+    const queue = this.subscriberQueues.get(clientId);
+    const queueStats = queue ? queue.getStats() : null;
+
     return {
       clientId,
       topics: Array.from(topics),
-      topicCount: topics.size
+      topicCount: topics.size,
+      queue: queueStats
     };
   }
 

@@ -88,6 +88,7 @@ class SystemRoutes {
           connection_counter: wsStats.connectionCounter || 0,
           active_connections: wsStats.totalClients || 0
         },
+        queues: pubsubStats.queues, // Include queue statistics
         ts: new Date().toISOString()
       };
 
