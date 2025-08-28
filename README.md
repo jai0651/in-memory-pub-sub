@@ -80,6 +80,182 @@ For development with auto-restart:
 npm run dev
 ```
 
+## Docker Deployment
+
+### Prerequisites
+
+- Docker installed and running
+- Docker Compose (optional, for multi-service deployment)
+
+### Quick Docker Start
+
+**Option 1: Using Docker Compose (Recommended)**
+```bash
+# Start the service
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop the service
+docker-compose down
+```
+
+**Option 2: Using Docker directly**
+```bash
+# Build the image
+docker build -t plivo-pubsub .
+
+# Run the container
+docker run -d --name plivo-pubsub-container -p 3000:3000 plivo-pubsub
+
+# View logs
+docker logs plivo-pubsub-container
+
+# Stop and remove container
+docker stop plivo-pubsub-container && docker rm plivo-pubsub-container
+```
+
+### Docker Configuration
+
+#### Environment Variables
+
+You can customize the container behavior with environment variables:
+
+```bash
+docker run -d \
+  --name plivo-pubsub-container \
+  -p 3000:3000 \
+  -e NODE_ENV=production \
+  -e PORT=3000 \
+  -e HOST=0.0.0.0 \
+  -e LOG_LEVEL=info \
+  -e MAX_MESSAGES_PER_TOPIC=100 \
+  -e MAX_QUEUE_SIZE=1000 \
+  -e BACKPRESSURE_POLICY=drop_oldest \
+  -e HEARTBEAT_INTERVAL=30000 \
+  plivo-pubsub
+```
+
+#### Production Deployment
+
+For production environments, use restart policies and volume mounts:
+
+```bash
+# Run with restart policy and log persistence
+docker run -d \
+  --name plivo-pubsub-container \
+  --restart unless-stopped \
+  -p 3000:3000 \
+  -v /var/log/plivo:/app/logs \
+  -e NODE_ENV=production \
+  plivo-pubsub
+
+# Or use Docker Compose with production settings
+docker-compose -f docker-compose.prod.yml up -d
+```
+
+#### Health Check
+
+The container includes a health check that monitors the service:
+
+```bash
+# Check container health
+docker ps
+
+# View health check logs
+docker inspect plivo-pubsub-container | grep -A 10 "Health"
+```
+
+### Docker Commands Reference
+
+```bash
+# Build image
+docker build -t plivo-pubsub .
+
+# Run container (interactive)
+docker run -it --rm -p 3000:3000 plivo-pubsub
+
+# Run container (detached)
+docker run -d --name plivo-pubsub-container -p 3000:3000 plivo-pubsub
+
+# View logs
+docker logs plivo-pubsub-container
+docker logs -f plivo-pubsub-container  # Follow logs
+
+# Execute commands in running container
+docker exec -it plivo-pubsub-container /bin/sh
+
+# Stop container
+docker stop plivo-pubsub-container
+
+# Remove container
+docker rm plivo-pubsub-container
+
+# Remove image
+docker rmi plivo-pubsub
+
+# Clean up all containers and images
+docker system prune -a
+```
+
+### Testing Docker Deployment
+
+Once the container is running, test the endpoints:
+
+```bash
+# Health check
+curl http://localhost:3000/health
+
+# Create a topic
+curl -X POST http://localhost:3000/topics \
+  -H "Content-Type: application/json" \
+  -d '{"name": "orders"}'
+
+# List topics
+curl http://localhost:3000/topics
+
+# System stats
+curl http://localhost:3000/stats
+```
+
+### Docker Compose Configuration
+
+The `docker-compose.yml` file includes:
+
+- **Service definition** with proper restart policy
+- **Port mapping** (3000:3000)
+- **Environment variables** configuration
+- **Health check** configuration
+- **Log volume** mounting
+- **Network configuration**
+
+### Troubleshooting Docker
+
+**Container won't start:**
+```bash
+# Check Docker daemon
+docker info
+
+# Check container logs
+docker logs plivo-pubsub-container
+
+# Check port availability
+lsof -i :3000
+```
+
+**Permission issues:**
+```bash
+# Run with proper permissions
+docker run -d --user $(id -u):$(id -g) -p 3000:3000 plivo-pubsub
+```
+
+**Port conflicts:**
+```bash
+# Use different port
+docker run -d -p 3001:3000 plivo-pubsub
+```
+
 ## API Documentation
 
 ### REST Endpoints
